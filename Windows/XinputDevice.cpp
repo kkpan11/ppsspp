@@ -13,6 +13,7 @@
 #include "XinputDevice.h"
 #include "Core/Config.h"
 #include "Core/Core.h"
+#include "Core/System.h"
 #include "Core/KeyMap.h"
 #include "Core/HLE/sceCtrl.h"
 
@@ -144,7 +145,7 @@ static const struct { int from; InputKeyCode to; } xinput_ctrl_map[] = {
 
 XinputDevice::XinputDevice() {
 	if (LoadXInputDLL() != 0) {
-		WARN_LOG(SCECTRL, "Failed to load XInput! DLL missing");
+		WARN_LOG(Log::sceCtrl, "Failed to load XInput! DLL missing");
 	}
 
 	for (size_t i = 0; i < ARRAY_SIZE(check_delay); ++i) {
@@ -252,7 +253,6 @@ void XinputDevice::ApplyButtons(int pad, const XINPUT_STATE &state) {
 		}
 	}
 }
-
 
 void XinputDevice::ApplyVibration(int pad, XINPUT_VIBRATION &vibration) {
 	if (PSP_IsInited()) {

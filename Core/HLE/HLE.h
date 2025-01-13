@@ -44,8 +44,7 @@ enum {
 	HLE_KERNEL_SYSCALL = 1 << 11,
 };
 
-struct HLEFunction
-{
+struct HLEFunction {
 	// This is the id, or nid, of the function (which is how it's linked.)
 	// Generally, the truncated least significant 32 bits of a SHA-1 hash.
 	u32 ID;
@@ -72,8 +71,7 @@ struct HLEFunction
 	u32 stackBytesToClear;
 };
 
-struct HLEModule
-{
+struct HLEModule {
 	const char *name;
 	int numFunctions;
 	const HLEFunction *funcTable;
@@ -81,8 +79,7 @@ struct HLEModule
 
 typedef char SyscallModuleName[32];
 
-struct Syscall
-{
+struct Syscall {
 	SyscallModuleName moduleName;
 	u32 symAddr;
 	u32 nid;
@@ -102,6 +99,8 @@ int GetFuncIndex(int moduleIndex, u32 nib);
 int GetModuleIndex(const char *modulename);
 
 void RegisterModule(const char *name, int numFunctions, const HLEFunction *funcTable);
+int GetNumRegisteredModules();
+const HLEModule *GetModuleByIndex(int index);
 
 // Run the current thread's callbacks after the syscall finishes.
 void hleCheckCurrentCallbacks();
@@ -115,8 +114,6 @@ void hleRunInterrupts();
 void hleDebugBreak();
 // Don't set temp regs to 0xDEADBEEF.
 void hleSkipDeadbeef();
-// Set time spent in debugger (for more useful debug stats while debugging.)
-void hleSetSteppingTime(double t);
 // Set time spent in realtime sync.
 void hleSetFlipTime(double t);
 // Check if the current syscall context is kernel.
@@ -129,6 +126,15 @@ u32 hleDelayResult(u32 result, const char *reason, int usec);
 u64 hleDelayResult(u64 result, const char *reason, int usec);
 void hleEatCycles(int cycles);
 void hleEatMicro(int usec);
+
+void hleCoreTimingForceCheck();
+
+// Causes the syscall to not fully execute immediately, instead give the Ge a chance to
+// execute display lists.
+void hleSplitSyscallOverGe();
+
+// Called after a split syscall from System.cpp
+void hleFinishSyscallAfterGe();
 
 inline int hleDelayResult(int result, const char *reason, int usec) {
 	return hleDelayResult((u32) result, reason, usec);
@@ -155,10 +161,10 @@ const HLEFunction *GetSyscallFuncPointer(MIPSOpcode op);
 // For jit, takes arg: const HLEFunction *
 void *GetQuickSyscallFunc(MIPSOpcode op);
 
-void hleDoLogInternal(LogType t, LogLevel level, u64 res, const char *file, int line, const char *reportTag, char retmask, const char *reason, const char *formatted_reason);
+void hleDoLogInternal(Log t, LogLevel level, u64 res, const char *file, int line, const char *reportTag, char retmask, const char *reason, const char *formatted_reason);
 
 template <typename T>
-T hleDoLog(LogType t, LogLevel level, T res, const char *file, int line, const char *reportTag, char retmask, const char *reason, ...) {
+T hleDoLog(Log t, LogLevel level, T res, const char *file, int line, const char *reportTag, char retmask, const char *reason, ...) {
 	if ((int)level > MAX_LOGLEVEL || !GenericLogEnabled(level, t)) {
 		return res;
 	}
@@ -186,7 +192,7 @@ T hleDoLog(LogType t, LogLevel level, T res, const char *file, int line, const c
 }
 
 template <typename T>
-T hleDoLog(LogType t, LogLevel level, T res, const char *file, int line, const char *reportTag, char retmask) {
+T hleDoLog(Log t, LogLevel level, T res, const char *file, int line, const char *reportTag, char retmask) {
 	if (((int)level > MAX_LOGLEVEL || !GenericLogEnabled(level, t)) && !reportTag) {
 		return res;
 	}
@@ -216,7 +222,7 @@ T hleDoLog(LogType t, LogLevel level, T res, const char *file, int line, const c
 #define HLE_LOG_LVERBOSE LVERBOSE
 #endif
 
-#define hleLogHelper(t, level, res, retmask, ...) hleDoLog(LogType::t, LogLevel::level, res, __FILE__, __LINE__, nullptr, retmask, ##__VA_ARGS__)
+#define hleLogHelper(t, level, res, retmask, ...) hleDoLog(t, LogLevel::level, res, __FILE__, __LINE__, nullptr, retmask, ##__VA_ARGS__)
 #define hleLogError(t, res, ...) hleLogHelper(t, LERROR, res, 'x', ##__VA_ARGS__)
 #define hleLogWarning(t, res, ...) hleLogHelper(t, LWARNING, res, 'x', ##__VA_ARGS__)
 #define hleLogDebug(t, res, ...) hleLogHelper(t, HLE_LOG_LDEBUG, res, 'x', ##__VA_ARGS__)
@@ -228,7 +234,6 @@ T hleDoLog(LogType t, LogLevel level, T res, const char *file, int line, const c
 #define hleLogSuccessVerboseX(t, res, ...) hleLogHelper(t, HLE_LOG_LVERBOSE, res, 'x', ##__VA_ARGS__)
 #define hleLogSuccessVerboseI(t, res, ...) hleLogHelper(t, HLE_LOG_LVERBOSE, res, 'i', ##__VA_ARGS__)
 
-#define hleReportError(t, res, ...) hleDoLog(LogType::t, LogLevel::LERROR, res, __FILE__, __LINE__, "", 'x', ##__VA_ARGS__)
-#define hleReportWarning(t, res, ...) hleDoLog(LogType::t, LogLevel::LWARNING, res, __FILE__, __LINE__, "", 'x', ##__VA_ARGS__)
-#define hleReportDebug(t, res, ...) hleDoLog(LogType::t, LogLevel::HLE_LOG_LDEBUG, res, __FILE__, __LINE__, "", 'x', ##__VA_ARGS__)
-#define hleReportVerbose(t, res, ...) hleDoLog(LogType::t, LogLevel::HLE_LOG_LVERBOSE, res, __FILE__, __LINE__, "", 'x', ##__VA_ARGS__)
+#define hleReportError(t, res, ...) hleDoLog(t, LogLevel::LERROR, res, __FILE__, __LINE__, "", 'x', ##__VA_ARGS__)
+#define hleReportWarning(t, res, ...) hleDoLog(t, LogLevel::LWARNING, res, __FILE__, __LINE__, "", 'x', ##__VA_ARGS__)
+#define hleReportDebug(t, res, ...) hleDoLog(t, LogLevel::HLE_LOG_LDEBUG, res, __FILE__, __LINE__, "", 'x', ##__VA_ARGS__)

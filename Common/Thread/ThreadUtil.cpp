@@ -2,7 +2,7 @@
 
 #if PPSSPP_PLATFORM(WINDOWS)
 
-#include <windows.h>
+#include "Common/CommonWindows.h"
 
 #ifdef __MINGW32__
 #include <excpt.h>
@@ -218,7 +218,7 @@ void SetCurrentThreadNameThroughException(const char *threadName) {
 void AssertCurrentThreadName(const char *threadName) {
 #ifdef TLS_SUPPORTED
 	if (strcmp(curThreadName, threadName) != 0) {
-		ERROR_LOG(SYSTEM, "Thread name assert failed: Expected %s, was %s", threadName, curThreadName);
+		ERROR_LOG(Log::System, "Thread name assert failed: Expected %s, was %s", threadName, curThreadName);
 	}
 #endif
 }

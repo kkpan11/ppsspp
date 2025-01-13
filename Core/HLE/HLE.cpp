@@ -34,9 +34,6 @@
 #include "Core/MIPS/MIPS.h"
 #include "Core/MIPS/MIPSCodeUtils.h"
 #include "Core/HLE/HLETables.h"
-#include "Core/HLE/sceIo.h"
-#include "Core/HLE/sceAudio.h"
-#include "Core/HLE/sceKernelMemory.h"
 #include "Core/HLE/sceKernelThread.h"
 #include "Core/HLE/sceKernelInterrupt.h"
 #include "Core/HLE/HLE.h"
@@ -59,6 +56,11 @@ enum
 	HLE_AFTER_SKIP_DEADBEEF     = 0x40,
 	// Execute pending mips calls.
 	HLE_AFTER_QUEUED_CALLS      = 0x80,
+	// Call CoreTiming::ForceCheck
+	HLE_AFTER_CORETIMING_FORCE_CHECK = 0x100,
+	// Split syscall over GE execution
+	HLE_SPLIT_SYSCALL_OVER_GE = 0x200,
+	HLE_SPLIT_SYSCALL_PART2 = 0x400,
 };
 
 static std::vector<HLEModule> moduleDB;
@@ -68,6 +70,13 @@ static const char *hleAfterSyscallReschedReason;
 static const HLEFunction *latestSyscall = nullptr;
 static uint32_t latestSyscallPC = 0;
 static int idleOp;
+
+// Split syscall support. NOTE: This needs to be saved in DoState somehow!
+static int splitSyscallEatCycles = 0;
+
+// Stats
+static double hleSteppingTime = 0.0;
+static double hleFlipTime = 0.0;
 
 struct HLEMipsCallInfo {
 	u32 func;
@@ -111,7 +120,7 @@ void hleDelayResultFinish(u64 userdata, int cycleslate)
 		__KernelReSchedule("woke from hle delay");
 	}
 	else
-		WARN_LOG(HLE, "Someone else woke up HLE-blocked thread %d?", threadID);
+		WARN_LOG(Log::HLE, "Someone else woke up HLE-blocked thread %d?", threadID);
 }
 
 void HLEInit() {
@@ -162,14 +171,20 @@ void HLEShutdown() {
 	mipsCallActions.clear();
 }
 
-void RegisterModule(const char *name, int numFunctions, const HLEFunction *funcTable)
-{
+int GetNumRegisteredModules() {
+	return (int)moduleDB.size();
+}
+
+void RegisterModule(const char *name, int numFunctions, const HLEFunction *funcTable) {
 	HLEModule module = {name, numFunctions, funcTable};
 	moduleDB.push_back(module);
 }
 
-int GetModuleIndex(const char *moduleName)
-{
+const HLEModule *GetModuleByIndex(int index) {
+	return &moduleDB[index];
+}
+
+int GetModuleIndex(const char *moduleName) {
 	for (size_t i = 0; i < moduleDB.size(); i++)
 		if (strcmp(moduleName, moduleDB[i].name) == 0)
 			return (int)i;
@@ -239,13 +254,13 @@ u32 GetSyscallOp(const char *moduleName, u32 nib) {
 		if (funcindex != -1) {
 			return (0x0000000c | (modindex<<18) | (funcindex<<6));
 		} else {
-			INFO_LOG(HLE, "Syscall (%s, %08x) unknown", moduleName, nib);
+			INFO_LOG(Log::HLE, "Syscall (%s, %08x) unknown", moduleName, nib);
 			return (0x0003FFCC | (modindex<<18));  // invalid syscall
 		}
 	}
 	else
 	{
-		ERROR_LOG(HLE, "Unknown module %s!", moduleName);
+		ERROR_LOG(Log::HLE, "Unknown module %s!", moduleName);
 		return (0x03FFFFCC);	// invalid syscall
 	}
 }
@@ -275,7 +290,7 @@ bool WriteSyscall(const char *moduleName, u32 nib, u32 address)
 {
 	if (nib == 0)
 	{
-		WARN_LOG_REPORT(HLE, "Wrote patched out nid=0 syscall (%s)", moduleName);
+		WARN_LOG_REPORT(Log::HLE, "Wrote patched out nid=0 syscall (%s)", moduleName);
 		Memory::Write_U32(MIPS_MAKE_JR_RA(), address); //patched out?
 		Memory::Write_U32(MIPS_MAKE_NOP(), address+4); //patched out?
 		return true;
@@ -289,7 +304,7 @@ bool WriteSyscall(const char *moduleName, u32 nib, u32 address)
 	}
 	else
 	{
-		ERROR_LOG_REPORT(HLE, "Unable to write unknown syscall: %s/%08x", moduleName, nib);
+		ERROR_LOG_REPORT(Log::HLE, "Unable to write unknown syscall: %s/%08x", moduleName, nib);
 		return false;
 	}
 }
@@ -348,30 +363,39 @@ void hleSkipDeadbeef()
 	hleAfterSyscall |= HLE_AFTER_SKIP_DEADBEEF;
 }
 
+void hleCoreTimingForceCheck() {
+	hleAfterSyscall |= HLE_AFTER_CORETIMING_FORCE_CHECK;
+}
+
 // Pauses execution after an HLE call.
-bool hleExecuteDebugBreak(const HLEFunction &func)
-{
+static bool hleExecuteDebugBreak(const HLEFunction *func) {
+	if (!func || coreState == CORE_RUNNING_GE) {
+		// Let's break on the next one.
+		return false;
+	}
+
 	const u32 NID_SUSPEND_INTR = 0x092968F4, NID_RESUME_INTR = 0x5F10D406;
 
 	// Never break on these, they're noise.
 	u32 blacklistedNIDs[] = {NID_SUSPEND_INTR, NID_RESUME_INTR, NID_IDLE};
 	for (size_t i = 0; i < ARRAY_SIZE(blacklistedNIDs); ++i)
 	{
-		if (func.ID == blacklistedNIDs[i])
+		if (func->ID == blacklistedNIDs[i])
 			return false;
 	}
 
-	Core_EnableStepping(true, "hle.step", latestSyscallPC);
+	INFO_LOG(Log::CPU, "Broke after syscall: %s", func->name);
+	Core_Break("hle.step", latestSyscallPC);
 	return true;
 }
 
 u32 hleDelayResult(u32 result, const char *reason, int usec) {
 	if (!__KernelIsDispatchEnabled()) {
-		WARN_LOG(HLE, "%s: Dispatch disabled, not delaying HLE result (right thing to do?)", latestSyscall ? latestSyscall->name : "?");
+		WARN_LOG(Log::HLE, "%s: Dispatch disabled, not delaying HLE result (right thing to do?)", latestSyscall ? latestSyscall->name : "?");
 	} else {
 		SceUID thread = __KernelGetCurThread();
 		if (KernelIsThreadWaiting(thread))
-			ERROR_LOG(HLE, "%s: Delaying a thread that's already waiting", latestSyscall ? latestSyscall->name : "?");
+			ERROR_LOG(Log::HLE, "%s: Delaying a thread that's already waiting", latestSyscall ? latestSyscall->name : "?");
 		CoreTiming::ScheduleEvent(usToCycles(usec), delayedResultEvent, thread);
 		__KernelWaitCurThread(WAITTYPE_HLEDELAY, 1, result, 0, false, reason);
 	}
@@ -380,11 +404,11 @@ u32 hleDelayResult(u32 result, const char *reason, int usec) {
 
 u64 hleDelayResult(u64 result, const char *reason, int usec) {
 	if (!__KernelIsDispatchEnabled()) {
-		WARN_LOG(HLE, "%s: Dispatch disabled, not delaying HLE result (right thing to do?)", latestSyscall ? latestSyscall->name : "?");
+		WARN_LOG(Log::HLE, "%s: Dispatch disabled, not delaying HLE result (right thing to do?)", latestSyscall ? latestSyscall->name : "?");
 	} else {
 		SceUID thread = __KernelGetCurThread();
 		if (KernelIsThreadWaiting(thread))
-			ERROR_LOG(HLE, "%s: Delaying a thread that's already waiting", latestSyscall ? latestSyscall->name : "?");
+			ERROR_LOG(Log::HLE, "%s: Delaying a thread that's already waiting", latestSyscall ? latestSyscall->name : "?");
 		u64 param = (result & 0xFFFFFFFF00000000) | thread;
 		CoreTiming::ScheduleEvent(usToCycles(usec), delayedResultEvent, param);
 		__KernelWaitCurThread(WAITTYPE_HLEDELAY, 1, (u32)result, 0, false, reason);
@@ -393,8 +417,16 @@ u64 hleDelayResult(u64 result, const char *reason, int usec) {
 }
 
 void hleEatCycles(int cycles) {
-	// Maybe this should Idle, at least for larger delays?  Could that cause issues?
-	currentMIPS->downcount -= cycles;
+	if (hleAfterSyscall & HLE_SPLIT_SYSCALL_OVER_GE) {
+		splitSyscallEatCycles = cycles;
+	} else {
+		// Maybe this should Idle, at least for larger delays?  Could that cause issues?
+		currentMIPS->downcount -= cycles;
+	}
+}
+
+void hleSplitSyscallOverGe() {
+	hleAfterSyscall |= HLE_SPLIT_SYSCALL_OVER_GE;
 }
 
 void hleEatMicro(int usec) {
@@ -418,7 +450,7 @@ void hleEnqueueCall(u32 func, int argc, const u32 *argv, PSPAction *afterAction)
 void hleFlushCalls() {
 	u32 &sp = currentMIPS->r[MIPS_REG_SP];
 	PSPPointer<HLEMipsCallStack> stackData;
-	VERBOSE_LOG(HLE, "Flushing %d HLE mips calls from %s, sp=%08x", (int)enqueuedMipsCalls.size(), latestSyscall ? latestSyscall->name : "?", sp);
+	VERBOSE_LOG(Log::HLE, "Flushing %d HLE mips calls from %s, sp=%08x", (int)enqueuedMipsCalls.size(), latestSyscall ? latestSyscall->name : "?", sp);
 
 	// First, we'll add a marker for the final return.
 	sp -= sizeof(HLEMipsCallStack);
@@ -459,7 +491,7 @@ void hleFlushCalls() {
 	}
 	enqueuedMipsCalls.clear();
 
-	DEBUG_LOG(HLE, "Executing HLE mips call at %08x, sp=%08x", currentMIPS->pc, sp);
+	DEBUG_LOG(Log::HLE, "Executing HLE mips call at %08x, sp=%08x", currentMIPS->pc, sp);
 }
 
 void HLEReturnFromMipsCall() {
@@ -470,14 +502,14 @@ void HLEReturnFromMipsCall() {
 	stackData.ptr = sp;
 
 	if ((stackData->nextOff & 0x0000000F) != 0 || !Memory::IsValidAddress(sp + stackData->nextOff)) {
-		ERROR_LOG(HLE, "Corrupt stack on HLE mips call return: %08x", stackData->nextOff);
+		ERROR_LOG(Log::HLE, "Corrupt stack on HLE mips call return: %08x", stackData->nextOff);
 		Core_UpdateState(CORE_RUNTIME_ERROR);
 		return;
 	}
 
 	if (stackData->actionIndex != 0xFFFFFFFF && stackData->actionIndex < (u32)mipsCallActions.size()) {
 		PSPAction *&action = mipsCallActions[stackData->actionIndex];
-		VERBOSE_LOG(HLE, "Executing action for HLE mips call at %08x, sp=%08x", stackData->func, sp);
+		VERBOSE_LOG(Log::HLE, "Executing action for HLE mips call at %08x, sp=%08x", stackData->func, sp);
 
 		// Search for the saved v0/v1 values, to preserve the PSPAction API...
 		PSPPointer<HLEMipsCallStack> finalMarker = stackData;
@@ -486,7 +518,7 @@ void HLEReturnFromMipsCall() {
 		}
 
 		if (finalMarker->nextOff != 0xFFFFFFFF) {
-			ERROR_LOG(HLE, "Corrupt stack on HLE mips call return action: %08x", finalMarker->nextOff);
+			ERROR_LOG(Log::HLE, "Corrupt stack on HLE mips call return action: %08x", finalMarker->nextOff);
 			Core_UpdateState(CORE_RUNTIME_ERROR);
 			return;
 		}
@@ -523,7 +555,7 @@ void HLEReturnFromMipsCall() {
 			mipsCallActions.clear();
 		}
 
-		VERBOSE_LOG(HLE, "Finished HLE mips calls, v0=%08x, sp=%08x", currentMIPS->r[MIPS_REG_V0], sp);
+		VERBOSE_LOG(Log::HLE, "Finished HLE mips calls, v0=%08x, sp=%08x", currentMIPS->r[MIPS_REG_V0], sp);
 		return;
 	}
 
@@ -534,7 +566,7 @@ void HLEReturnFromMipsCall() {
 	for (int i = 0; i < (int)stackData->argc; i++) {
 		currentMIPS->r[MIPS_REG_A0 + i] = Memory::Read_U32(sp + sizeof(HLEMipsCallStack) + i * sizeof(u32));
 	}
-	DEBUG_LOG(HLE, "Executing next HLE mips call at %08x, sp=%08x", currentMIPS->pc, sp);
+	DEBUG_LOG(Log::HLE, "Executing next HLE mips call at %08x, sp=%08x", currentMIPS->pc, sp);
 }
 
 const static u32 deadbeefRegs[12] = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF};
@@ -556,8 +588,27 @@ inline static void SetDeadbeefRegs()
 	currentMIPS->hi = 0xDEADBEEF;
 }
 
-inline void hleFinishSyscall(const HLEFunction &info)
-{
+static void hleFinishSyscall(const HLEFunction *info) {
+	if (hleAfterSyscall & HLE_SPLIT_SYSCALL_OVER_GE) {
+		hleAfterSyscall &= ~HLE_SPLIT_SYSCALL_OVER_GE;
+		hleAfterSyscall |= HLE_SPLIT_SYSCALL_PART2;
+		// Switch to GE execution immediately.
+		// coreState is checked after the syscall, always.
+		Core_SwitchToGe();
+		return;
+	}
+
+	if (hleAfterSyscall & HLE_SPLIT_SYSCALL_PART2) {
+		// Eat the extra cycle we added above.
+		hleEatCycles(splitSyscallEatCycles + 1);
+		// Make sure to zero it so it's not accidentally re-used.
+		splitSyscallEatCycles = 0;
+	}
+
+	if (hleAfterSyscall & HLE_AFTER_CORETIMING_FORCE_CHECK) {
+		CoreTiming::ForceCheck();
+	}
+
 	if ((hleAfterSyscall & HLE_AFTER_SKIP_DEADBEEF) == 0)
 		SetDeadbeefRegs();
 
@@ -574,10 +625,8 @@ inline void hleFinishSyscall(const HLEFunction &info)
 	else if ((hleAfterSyscall & HLE_AFTER_RESCHED) != 0)
 		__KernelReSchedule(hleAfterSyscallReschedReason);
 
-	if ((hleAfterSyscall & HLE_AFTER_DEBUG_BREAK) != 0)
-	{
-		if (!hleExecuteDebugBreak(info))
-		{
+	if ((hleAfterSyscall & HLE_AFTER_DEBUG_BREAK) != 0) {
+		if (!hleExecuteDebugBreak(info)) {
 			// We'll do it next syscall.
 			hleAfterSyscall = HLE_AFTER_DEBUG_BREAK;
 			hleAfterSyscallReschedReason = 0;
@@ -587,6 +636,10 @@ inline void hleFinishSyscall(const HLEFunction &info)
 
 	hleAfterSyscall = HLE_AFTER_NOTHING;
 	hleAfterSyscallReschedReason = 0;
+}
+
+void hleFinishSyscallAfterGe() {
+	hleFinishSyscall(nullptr);
 }
 
 static void updateSyscallStats(int modulenum, int funcnum, double total)
@@ -639,15 +692,15 @@ inline void CallSyscallWithFlags(const HLEFunction *info)
 	}
 
 	if ((flags & HLE_NOT_DISPATCH_SUSPENDED) && !__KernelIsDispatchEnabled()) {
-		RETURN(hleLogDebug(HLE, SCE_KERNEL_ERROR_CAN_NOT_WAIT, "dispatch suspended"));
+		RETURN(hleLogDebug(Log::HLE, SCE_KERNEL_ERROR_CAN_NOT_WAIT, "dispatch suspended"));
 	} else if ((flags & HLE_NOT_IN_INTERRUPT) && __IsInInterrupt()) {
-		RETURN(hleLogDebug(HLE, SCE_KERNEL_ERROR_ILLEGAL_CONTEXT, "in interrupt"));
+		RETURN(hleLogDebug(Log::HLE, SCE_KERNEL_ERROR_ILLEGAL_CONTEXT, "in interrupt"));
 	} else {
 		info->func();
 	}
 
 	if (hleAfterSyscall != HLE_AFTER_NOTHING)
-		hleFinishSyscall(*info);
+		hleFinishSyscall(info);
 	else
 		SetDeadbeefRegs();
 }
@@ -659,7 +712,7 @@ inline void CallSyscallWithoutFlags(const HLEFunction *info)
 	info->func();
 
 	if (hleAfterSyscall != HLE_AFTER_NOTHING)
-		hleFinishSyscall(*info);
+		hleFinishSyscall(info);
 	else
 		SetDeadbeefRegs();
 }
@@ -670,15 +723,15 @@ const HLEFunction *GetSyscallFuncPointer(MIPSOpcode op)
 	int funcnum = callno & 0xFFF;
 	int modulenum = (callno & 0xFF000) >> 12;
 	if (funcnum == 0xfff) {
-		ERROR_LOG(HLE, "Unknown syscall: Module: %s (module: %d func: %d)", modulenum > (int)moduleDB.size() ? "(unknown)" : moduleDB[modulenum].name, modulenum, funcnum);
+		ERROR_LOG(Log::HLE, "Unknown syscall: Module: %s (module: %d func: %d)", modulenum > (int)moduleDB.size() ? "(unknown)" : moduleDB[modulenum].name, modulenum, funcnum);
 		return NULL;
 	}
 	if (modulenum >= (int)moduleDB.size()) {
-		ERROR_LOG(HLE, "Syscall had bad module number %d - probably executing garbage", modulenum);
+		ERROR_LOG(Log::HLE, "Syscall had bad module number %d - probably executing garbage", modulenum);
 		return NULL;
 	}
 	if (funcnum >= moduleDB[modulenum].numFunctions) {
-		ERROR_LOG(HLE, "Syscall had bad function number %d in module %d - probably executing garbage", funcnum, modulenum);
+		ERROR_LOG(Log::HLE, "Syscall had bad function number %d in module %d - probably executing garbage", funcnum, modulenum);
 		return NULL;
 	}
 	return &moduleDB[modulenum].funcTable[funcnum];
@@ -691,7 +744,8 @@ void *GetQuickSyscallFunc(MIPSOpcode op) {
 	const HLEFunction *info = GetSyscallFuncPointer(op);
 	if (!info || !info->func)
 		return nullptr;
-	DEBUG_LOG(HLE, "Compiling syscall to %s", info->name);
+
+	VERBOSE_LOG(Log::HLE, "Compiling syscall to '%s'", info->name);
 
 	// TODO: Do this with a flag?
 	if (op == idleOp)
@@ -701,18 +755,11 @@ void *GetQuickSyscallFunc(MIPSOpcode op) {
 	return (void *)&CallSyscallWithoutFlags;
 }
 
-static double hleSteppingTime = 0.0;
-void hleSetSteppingTime(double t) {
-	hleSteppingTime += t;
-}
-
-static double hleFlipTime = 0.0;
 void hleSetFlipTime(double t) {
 	hleFlipTime = t;
 }
 
-void CallSyscall(MIPSOpcode op)
-{
+void CallSyscall(MIPSOpcode op) {
 	PROFILE_THIS_SCOPE("syscall");
 	double start = 0.0;  // need to initialize to fix the race condition where coreCollectDebugStats is enabled in the middle of this func.
 	if (coreCollectDebugStats) {
@@ -735,18 +782,17 @@ void CallSyscall(MIPSOpcode op)
 	}
 	else {
 		RETURN(SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED);
-		ERROR_LOG_REPORT(HLE, "Unimplemented HLE function %s", info->name ? info->name : "(\?\?\?)");
+		ERROR_LOG_REPORT(Log::HLE, "Unimplemented HLE function %s", info->name ? info->name : "(\?\?\?)");
 	}
 
 	if (coreCollectDebugStats) {
 		u32 callno = (op >> 6) & 0xFFFFF; //20 bits
 		int funcnum = callno & 0xFFF;
 		int modulenum = (callno & 0xFF000) >> 12;
-		double total = time_now_d() - start - hleSteppingTime;
+		double total = time_now_d() - start;
 		if (total >= hleFlipTime)
 			total -= hleFlipTime;
 		_dbg_assert_msg_(total >= 0.0, "Time spent in syscall became negative");
-		hleSteppingTime = 0.0;
 		hleFlipTime = 0.0;
 		updateSyscallStats(modulenum, funcnum, total);
 	}
@@ -853,7 +899,7 @@ size_t hleFormatLogArgs(char *message, size_t sz, const char *argmask) {
 	return used;
 }
 
-void hleDoLogInternal(LogType t, LogLevel level, u64 res, const char *file, int line, const char *reportTag, char retmask, const char *reason, const char *formatted_reason) {
+void hleDoLogInternal(Log t, LogLevel level, u64 res, const char *file, int line, const char *reportTag, char retmask, const char *reason, const char *formatted_reason) {
 	char formatted_args[4096];
 	const char *funcName = "?";
 	u32 funcFlags = 0;
