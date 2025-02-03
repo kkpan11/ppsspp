@@ -24,11 +24,7 @@
 #include "Common/UI/UIScreen.h"
 #include "Common/UI/ViewGroup.h"
 #include "UI/MiscScreens.h"
-
-enum class PauseScreenMode {
-	MAIN,
-	DISPLAY_SETTINGS,
-};
+#include "UI/Screen.h"
 
 class GamePauseScreen : public UIDialogScreenWithGameBackground {
 public:
@@ -65,7 +61,14 @@ private:
 
 	// hack
 	bool finishNextFrame_ = false;
-	PauseScreenMode mode_ = PauseScreenMode::MAIN;
+	DialogResult finishNextFrameResult_ = DR_CANCEL;
 
 	UI::Button *playButton_ = nullptr;
+
+	// State change tracking, a bit ugly heh, but works.
+	bool lastOnline_ = false;
+	bool lastNetInited_ = false;
+	bool lastNetInetInited_ = false;
+	bool lastAdhocServerConnected_ = false;
+	bool lastDNSConfigLoaded_ = false;
 };

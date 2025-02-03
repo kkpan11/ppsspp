@@ -16,7 +16,9 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include "Common/Serialize/SerializeFuncs.h"
-#include "Common/LogManager.h"
+#include "Common/Log/LogManager.h"
+#include "Common/System/OSD.h"
+
 #include "Core/Core.h"
 #include "Core/Config.h"
 #include "Core/CwCheat.h"
@@ -35,7 +37,7 @@
 #include "Core/Reporting.h"
 #include "Core/SaveState.h"
 #include "Core/System.h"
-#include "GPU/GPUInterface.h"
+#include "GPU/GPUCommon.h"
 #include "GPU/GPUState.h"
 
 #include "__sceAudio.h"
@@ -66,7 +68,9 @@
 #include "sceMp3.h"
 #include "sceMpeg.h"
 #include "sceNet.h"
+#include "sceNp.h"
 #include "sceNetAdhoc.h"
+#include "sceNetAdhocMatching.h"
 #include "scePower.h"
 #include "sceUtility.h"
 #include "sceUmd.h"
@@ -85,7 +89,9 @@
 #include "sceDmac.h"
 #include "sceMp4.h"
 #include "sceOpenPSID.h"
+#include "sceHttp.h"
 #include "Core/Util/PPGeDraw.h"
+#include "sceHttp.h"
 
 /*
 17: [MIPS32 R4K 00000000 ]: Loader: Type: 1 Vaddr: 00000000 Filesz: 2856816 Memsz: 2856816 
@@ -98,15 +104,17 @@ static bool kernelRunning = false;
 KernelObjectPool kernelObjects;
 KernelStats kernelStats;
 u32 registeredExitCbId;
+u32 g_GPOBits;  // Really just 8 bits on the real hardware.
+u32 g_GPIBits;  // Really just 8 bits on the real hardware.
 
 void __KernelInit()
 {
 	if (kernelRunning)
 	{
-		ERROR_LOG(SCEKERNEL, "Can't init kernel when kernel is running");
+		ERROR_LOG(Log::sceKernel, "Can't init kernel when kernel is running");
 		return;
 	}
-	INFO_LOG(SCEKERNEL, "Initializing kernel...");
+	INFO_LOG(Log::sceKernel, "Initializing kernel...");
 
 	__KernelTimeInit();
 	__InterruptsInit();
@@ -122,6 +130,7 @@ void __KernelInit()
 	__IoInit();
 	__JpegInit();
 	__AudioInit();
+	__Mp3Init();
 	__SasInit();
 	__AtracInit();
 	__CccInit();
@@ -140,6 +149,7 @@ void __KernelInit()
 	__FontInit();
 	__NetInit();
 	__NetAdhocInit();
+	__NetAdhocMatchingInit();
 	__VaudioInit();
 	__CheatInit();
 	__HeapInit();
@@ -150,6 +160,8 @@ void __KernelInit()
 	__UsbCamInit();
 	__UsbMicInit();
 	__OpenPSIDInit();
+	__HttpInit();
+	__NpInit();
 	
 	SaveState::Init();  // Must be after IO, as it may create a directory
 	Reporting::Init();
@@ -158,21 +170,23 @@ void __KernelInit()
 	__PPGeInit();
 
 	kernelRunning = true;
-	INFO_LOG(SCEKERNEL, "Kernel initialized.");
+	g_GPOBits = 0;
+	INFO_LOG(Log::sceKernel, "Kernel initialized.");
 }
 
 void __KernelShutdown()
 {
 	if (!kernelRunning)
 	{
-		ERROR_LOG(SCEKERNEL, "Can't shut down kernel - not running");
+		ERROR_LOG(Log::sceKernel, "Can't shut down kernel - not running");
 		return;
 	}
 	kernelObjects.List();
-	INFO_LOG(SCEKERNEL, "Shutting down kernel - %i kernel objects alive", kernelObjects.GetCount());
+	INFO_LOG(Log::sceKernel, "Shutting down kernel - %i kernel objects alive", kernelObjects.GetCount());
 	hleCurrentThreadName = NULL;
 	kernelObjects.Clear();
 
+	__HttpShutdown();
 	__OpenPSIDShutdown();
 	__UsbCamShutdown();
 	__UsbMicShutdown();
@@ -182,6 +196,7 @@ void __KernelShutdown()
 	__VideoPmpShutdown();
 	__AACShutdown();
 	__NetAdhocShutdown();
+	__NetAdhocMatchingShutdown();
 	__NetShutdown();
 	__FontShutdown();
 
@@ -198,6 +213,7 @@ void __KernelShutdown()
 	__AtracShutdown();
 	__AudioShutdown();
 	__IoShutdown();
+	__HeapShutdown();
 	__KernelMutexShutdown();
 	__KernelThreadingShutdown();
 	__KernelMemoryShutdown();
@@ -311,16 +327,22 @@ std::string __KernelStateSummary() {
 
 void sceKernelExitGame()
 {
-	INFO_LOG(SCEKERNEL, "sceKernelExitGame");
+	INFO_LOG(Log::sceKernel, "sceKernelExitGame");
 	__KernelSwitchOffThread("game exited");
 	Core_Stop();
+
+	g_OSD.Show(OSDType::MESSAGE_INFO, "sceKernelExitGame()", 0.0f, "kernelexit");
+	hleNoLogVoid();
 }
 
 void sceKernelExitGameWithStatus()
 {
-	INFO_LOG(SCEKERNEL, "sceKernelExitGameWithStatus");
+	INFO_LOG(Log::sceKernel, "sceKernelExitGameWithStatus");
 	__KernelSwitchOffThread("game exited");
 	Core_Stop();
+
+	g_OSD.Show(OSDType::MESSAGE_INFO, "sceKernelExitGameWithStatus()");
+	hleNoLogVoid();
 }
 
 u32 sceKernelDevkitVersion()
@@ -331,34 +353,29 @@ u32 sceKernelDevkitVersion()
 	int revision = firmwareVersion % 10;
 	int devkitVersion = (major << 24) | (minor << 16) | (revision << 8) | 0x10;
 
-	DEBUG_LOG(SCEKERNEL, "%08x=sceKernelDevkitVersion()", devkitVersion);
-	return devkitVersion;
+	return hleLogDebug(Log::sceKernel, devkitVersion, "%d.%d.%d", major, minor, revision);
 }
 
-u32 sceKernelRegisterKprintfHandler()
-{
-	ERROR_LOG(SCEKERNEL, "UNIMPL sceKernelRegisterKprintfHandler()");
-	return 0;
+u32 sceKernelRegisterKprintfHandler() {
+	return hleLogError(Log::sceKernel, 0, "UNIMPL");
 }
 
-int sceKernelRegisterDefaultExceptionHandler()
-{
-	ERROR_LOG(SCEKERNEL, "UNIMPL sceKernelRegisterDefaultExceptionHandler()");
-	return 0;
+int sceKernelRegisterDefaultExceptionHandler() {
+	return hleLogError(Log::sceKernel, 0, "UNIMPL");
 }
 
-void sceKernelSetGPO(u32 ledAddr)
+void sceKernelSetGPO(u32 ledBits)
 {
-	// Sets debug LEDs.
-	// Not really interesting, and a few games really spam it
-	// DEBUG_LOG(SCEKERNEL, "sceKernelSetGPO(%02x)", ledAddr);
+	// Sets debug LEDs. Some games do interesting stuff with this, like a metronome in Parappa.
+	// Shows up as a vertical strip of LEDs at the side of the screen, if enabled.
+	g_GPOBits = ledBits;
 }
 
 u32 sceKernelGetGPI()
 {
 	// Always returns 0 on production systems.
-	DEBUG_LOG(SCEKERNEL, "0=sceKernelGetGPI()");
-	return 0;
+	// On developer systems, there are 8 switches that control the lower 8 bits of the return value.
+	return hleLogDebug(Log::sceKernel, g_GPIBits);
 }
 
 // #define LOG_CACHE
@@ -370,107 +387,104 @@ u32 sceKernelGetGPI()
 int sceKernelDcacheInvalidateRange(u32 addr, int size)
 {
 #ifdef LOG_CACHE
-	NOTICE_LOG(CPU,"sceKernelDcacheInvalidateRange(%08x, %i)", addr, size);
+	NOTICE_LOG(Log::CPU,"sceKernelDcacheInvalidateRange(%08x, %i)", addr, size);
 #endif
 	if (size < 0 || (int) addr + size < 0)
-		return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
+		return hleNoLog(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
 
 	if (size > 0)
 	{
 		if ((addr % 64) != 0 || (size % 64) != 0)
-			return SCE_KERNEL_ERROR_CACHE_ALIGNMENT;
+			return hleNoLog(SCE_KERNEL_ERROR_CACHE_ALIGNMENT);
 
 		if (addr != 0)
 			gpu->InvalidateCache(addr, size, GPU_INVALIDATE_HINT);
 	}
 	hleEatCycles(190);
-	return 0;
+	return hleNoLog(0);
 }
 
 int sceKernelIcacheInvalidateRange(u32 addr, int size) {
-	DEBUG_LOG(CPU, "sceKernelIcacheInvalidateRange(%08x, %i)", addr, size);
 	if (size != 0)
 		currentMIPS->InvalidateICache(addr, size);
-	return 0;
+	return hleLogDebug(Log::CPU, 0);
 }
 
 int sceKernelDcacheWritebackAll()
 {
 #ifdef LOG_CACHE
-	NOTICE_LOG(CPU,"sceKernelDcacheWritebackAll()");
+	NOTICE_LOG(Log::CPU,"sceKernelDcacheWritebackAll()");
 #endif
 	// Some games seem to use this a lot, it doesn't make sense
 	// to zap the whole texture cache.
 	gpu->InvalidateCache(0, -1, GPU_INVALIDATE_ALL);
 	hleEatCycles(3524);
 	hleReSchedule("dcache writeback all");
-	return 0;
+	return hleNoLog(0);
 }
 
 int sceKernelDcacheWritebackRange(u32 addr, int size)
 {
 #ifdef LOG_CACHE
-	NOTICE_LOG(CPU,"sceKernelDcacheWritebackRange(%08x, %i)", addr, size);
+	NOTICE_LOG(Log::CPU,"sceKernelDcacheWritebackRange(%08x, %i)", addr, size);
 #endif
 	if (size < 0)
-		return SCE_KERNEL_ERROR_INVALID_SIZE;
+		return hleLogError(Log::sceKernel, SCE_KERNEL_ERROR_INVALID_SIZE);
 
 	if (size > 0 && addr != 0) {
 		gpu->InvalidateCache(addr, size, GPU_INVALIDATE_HINT);
 	}
 	hleEatCycles(165);
-	return 0;
+	return hleNoLog(0);
 }
 
 int sceKernelDcacheWritebackInvalidateRange(u32 addr, int size)
 {
 #ifdef LOG_CACHE
-	NOTICE_LOG(CPU,"sceKernelDcacheInvalidateRange(%08x, %i)", addr, size);
+	NOTICE_LOG(Log::CPU,"sceKernelDcacheInvalidateRange(%08x, %i)", addr, size);
 #endif
 	if (size < 0)
-		return SCE_KERNEL_ERROR_INVALID_SIZE;
+		return hleLogError(Log::sceKernel, SCE_KERNEL_ERROR_INVALID_SIZE);
 
 	if (size > 0 && addr != 0) {
 		gpu->InvalidateCache(addr, size, GPU_INVALIDATE_HINT);
 	}
 	hleEatCycles(165);
-	return 0;
+	return hleNoLog(0);
 }
 
 int sceKernelDcacheWritebackInvalidateAll()
 {
 #ifdef LOG_CACHE
-	NOTICE_LOG(CPU,"sceKernelDcacheInvalidateAll()");
+	NOTICE_LOG(Log::CPU,"sceKernelDcacheInvalidateAll()");
 #endif
 	gpu->InvalidateCache(0, -1, GPU_INVALIDATE_ALL);
 	hleEatCycles(1165);
 	hleReSchedule("dcache invalidate all");
-	return 0;
+	return hleLogDebug(Log::CPU, 0, "Dcache invalidated");
 }
 
 u32 sceKernelIcacheInvalidateAll()
 {
 #ifdef LOG_CACHE
-	NOTICE_LOG(CPU, "Icache invalidated - should clear JIT someday");
+	NOTICE_LOG(Log::CPU, "Icache invalidated - should clear JIT someday");
 #endif
 	// Note that this doesn't actually fully invalidate all with such a large range.
 	currentMIPS->InvalidateICache(0, 0x3FFFFFFF);
-	return 0;
+	return hleLogDebug(Log::CPU, 0, "Icache invalidated");
 }
 
 u32 sceKernelIcacheClearAll()
 {
 #ifdef LOG_CACHE
-	NOTICE_LOG(CPU, "Icache cleared - should clear JIT someday");
+	NOTICE_LOG(Log::CPU, "Icache cleared - should clear JIT someday");
 #endif
-	DEBUG_LOG(CPU, "Icache cleared - should clear JIT someday");
 	// Note that this doesn't actually fully invalidate all with such a large range.
 	currentMIPS->InvalidateICache(0, 0x3FFFFFFF);
-	return 0;
+	return hleLogDebug(Log::CPU, 0, "Icache cleared");
 }
 
-void KernelObject::GetQuickInfo(char *ptr, int size)
-{
+void KernelObject::GetQuickInfo(char *ptr, int size) {
 	strcpy(ptr, "-");
 }
 
@@ -494,16 +508,8 @@ SceUID KernelObjectPool::Create(KernelObject *obj, int rangeBottom, int rangeTop
 		}
 	}
 
-	ERROR_LOG_REPORT(SCEKERNEL, "Unable to allocate kernel object, too many objects slots in use.");
+	ERROR_LOG_REPORT(Log::sceKernel, "Unable to allocate kernel object, too many objects slots in use.");
 	return 0;
-}
-
-bool KernelObjectPool::IsValid(SceUID handle) const {
-	int index = handle - handleOffset;
-	if (index < 0 || index >= maxCount)
-		return false;
-	else
-		return occupied[index];
 }
 
 void KernelObjectPool::Clear() {
@@ -523,9 +529,9 @@ void KernelObjectPool::List() {
 			char buffer[256];
 			if (pool[i]) {
 				pool[i]->GetQuickInfo(buffer, sizeof(buffer));
-				DEBUG_LOG(SCEKERNEL, "KO %i: %s \"%s\": %s", i + handleOffset, pool[i]->GetTypeName(), pool[i]->GetName(), buffer);
+				DEBUG_LOG(Log::sceKernel, "KO %i: %s \"%s\": %s", i + handleOffset, pool[i]->GetTypeName(), pool[i]->GetName(), buffer);
 			} else {
-				ERROR_LOG(SCEKERNEL, "KO %i: bad object", i + handleOffset);
+				ERROR_LOG(Log::sceKernel, "KO %i: bad object", i + handleOffset);
 			}
 		}
 	}
@@ -550,7 +556,7 @@ void KernelObjectPool::DoState(PointerWrap &p) {
 
 	if (_maxCount != maxCount) {
 		p.SetError(p.ERROR_FAILURE);
-		ERROR_LOG(SCEKERNEL, "Unable to load state: different kernel object storage.");
+		ERROR_LOG(Log::sceKernel, "Unable to load state: different kernel object storage.");
 		return;
 	}
 
@@ -627,7 +633,7 @@ KernelObject *KernelObjectPool::CreateByIDType(int type) {
 		return __KernelThreadEventHandlerObject();
 
 	default:
-		ERROR_LOG(SAVESTATE, "Unable to load state: could not find object type %d.", type);
+		ERROR_LOG(Log::SaveState, "Unable to load state: could not find object type %d.", type);
 		return NULL;
 	}
 }
@@ -643,7 +649,7 @@ struct SystemStatus {
 };
 
 static int sceKernelReferSystemStatus(u32 statusPtr) {
-	DEBUG_LOG(SCEKERNEL, "sceKernelReferSystemStatus(%08x)", statusPtr);
+	DEBUG_LOG(Log::sceKernel, "sceKernelReferSystemStatus(%08x)", statusPtr);
 	auto status = PSPPointer<SystemStatus>::Create(statusPtr);
 	if (status.IsValid()) {
 		memset((SystemStatus *)status, 0, sizeof(SystemStatus));
@@ -682,16 +688,14 @@ static u32 sceKernelReferThreadProfiler() {
 	// This seems to simply has no parameter:
 	// https://pspdev.github.io/pspsdk/group__ThreadMan.html#ga8fd30da51b9dc0507ac4dae04a7e4a17
 	// In testing it just returns null in around 140-150 cycles.  See issue #17623.
-	DEBUG_LOG(SCEKERNEL, "0=sceKernelReferThreadProfiler()");
 	hleEatCycles(140);
-	return 0;
+	return hleLogDebug(Log::sceKernel, 0);
 }
 
 static int sceKernelReferGlobalProfiler() {
-	DEBUG_LOG(SCEKERNEL, "0=sceKernelReferGlobalProfiler()");
 	// See sceKernelReferThreadProfiler(), similar.
 	hleEatCycles(140);
-	return 0;
+	return hleLogDebug(Log::sceKernel, 0);
 }
 
 const HLEFunction ThreadManForUser[] =
@@ -1019,5 +1023,288 @@ void Register_UtilsForKernel()
 
 void Register_ThreadManForKernel()
 {
-	RegisterModule("ThreadManForKernel", ARRAY_SIZE(ThreadManForKernel), ThreadManForKernel);		
+	RegisterModule("ThreadManForKernel", ARRAY_SIZE(ThreadManForKernel), ThreadManForKernel);
+}
+
+const char *KernelErrorToString(u32 err) {
+	switch (err) {
+	case (u32)-1: return "-1";
+	case 0x00000000: return "ERROR_OK";
+	case 0x80000020: return "ALREADY";
+	case 0x80000021: return "BUSY";
+	case 0x80000022: return "OUT_OF_MEMORY";
+	case 0x80000023: return "PRIV_REQUIRED";
+	case 0x80000100: return "INVALID_ID";
+	case 0x80000101: return "INVALID_NAME";
+	case 0x80000102: return "INVALID_INDEX";
+	case 0x80000103: return "INVALID_POINTER";
+	case 0x80000104: return "INVALID_SIZE";
+	case 0x80000105: return "INVALID_FLAG";
+	case 0x80000106: return "INVALID_COMMAND";
+	case 0x80000107: return "INVALID_MODE";
+	case 0x80000108: return "INVALID_FORMAT";
+	case 0x800001FE: return "INVALID_VALUE";
+	case 0x800001FF: return "INVALID_ARGUMENT";
+	case 0x80000209: return "BAD_FILE";
+	case 0x8000020D: return "ACCESS_ERROR";
+	case 0x80010002: return "ERRNO_FILE_NOT_FOUND";
+	case 0x80010007: return "ERRNO_ARG_LIST_TOO_LONG";
+	case 0x80010009: return "ERRNO_INVALID_FILE_DESCRIPTOR";
+	case 0x8001000B: return "ERRNO_RESOURCE_UNAVAILABLE";
+	case 0x8001000C: return "ERRNO_NO_MEMORY";
+	case 0x8001000D: return "ERRNO_NO_PERM";
+	case 0x8001000E: return "ERRNO_FILE_INVALID_ADDR";
+	case 0x80010010: return "ERRNO_DEVICE_BUSY";
+	case 0x80010011: return "ERRNO_FILE_ALREADY_EXISTS";
+	case 0x80010012: return "ERRNO_CROSS_DEV_LINK";
+	case 0x80010013: return "ERRNO_DEVICE_NOT_FOUND";
+	case 0x80010014: return "ERRNO_NOT_A_DIRECTORY";
+	case 0x80010015: return "ERRNO_IS_DIRECTORY";
+	case 0x80010016: return "ERRNO_INVALID_ARGUMENT";
+	case 0x80010018: return "ERRNO_TOO_MANY_OPEN_SYSTEM_FILES";
+	case 0x8001001B: return "ERRNO_FILE_IS_TOO_BIG";
+	case 0x8001001C: return "ERRNO_DEVICE_NO_FREE_SPACE";
+	case 0x8001001E: return "ERRNO_READ_ONLY";
+	case 0x80010020: return "ERRNO_CLOSED";
+	case 0x80010024: return "ERRNO_FILE_PATH_TOO_LONG";
+	case 0x80010047: return "ERRNO_FILE_PROTOCOL";
+	case 0x8001005A: return "ERRNO_DIRECTORY_IS_NOT_EMPTY";
+	case 0x8001005C: return "ERRNO_TOO_MANY_SYMBOLIC_LINKS";
+	case 0x80010062: return "ERRNO_FILE_ADDR_IN_USE";
+	case 0x80010067: return "ERRNO_CONNECTION_ABORTED";
+	case 0x80010068: return "ERRNO_CONNECTION_RESET";
+	case 0x80010069: return "ERRNO_NO_FREE_BUF_SPACE";
+	case 0x8001006E: return "ERRNO_FILE_TIMEOUT";
+	case 0x80010077: return "ERRNO_IN_PROGRESS";
+	case 0x80010078: return "ERRNO_ALREADY";
+	case 0x8001007B: return "ERRNO_NO_MEDIA";
+	case 0x8001007C: return "ERRNO_INVALID_MEDIUM";
+	case 0x8001007D: return "ERRNO_ADDRESS_NOT_AVAILABLE";
+	case 0x8001007F: return "ERRNO_IS_ALREADY_CONNECTED";
+	case 0x80010080: return "ERRNO_NOT_CONNECTED";
+	case 0x80010084: return "ERRNO_FILE_QUOTA_EXCEEDED";
+	case 0x8001B000: return "ERRNO_FUNCTION_NOT_SUPPORTED";
+	case 0x8001B001: return "ERRNO_ADDR_OUT_OF_MAIN_MEM";
+	case 0x8001B002: return "ERRNO_INVALID_UNIT_NUM";
+	case 0x8001B003: return "ERRNO_INVALID_FILE_SIZE";
+	case 0x8001B004: return "ERRNO_INVALID_FLAG";
+	case 0x80020001: return "ERROR";
+	case 0x80020002: return "NOTIMP";
+	case 0x80020032: return "ILLEGAL_EXPCODE";
+	case 0x80020033: return "EXPHANDLER_NOUSE";
+	case 0x80020034: return "EXPHANDLER_USED";
+	case 0x80020035: return "SYCALLTABLE_NOUSED";
+	case 0x80020036: return "SYCALLTABLE_USED";
+	case 0x80020037: return "ILLEGAL_SYSCALLTABLE";
+	case 0x80020038: return "ILLEGAL_PRIMARY_SYSCALL_NUMBER";
+	case 0x80020039: return "PRIMARY_SYSCALL_NUMBER_INUSE";
+	case 0x80020064: return "ILLEGAL_CONTEXT";
+	case 0x80020065: return "ILLEGAL_INTRCODE";
+	case 0x80020066: return "CPUDI";
+	case 0x80020067: return "FOUND_HANDLER";
+	case 0x80020068: return "NOTFOUND_HANDLER";
+	case 0x80020069: return "ILLEGAL_INTRLEVEL";
+	case 0x8002006a: return "ILLEGAL_ADDRESS";
+	case 0x8002006b: return "ILLEGAL_INTRPARAM";
+	case 0x8002006c: return "ILLEGAL_STACK_ADDRESS";
+	case 0x8002006d: return "ALREADY_STACK_SET";
+	case 0x80020096: return "NO_TIMER";
+	case 0x80020097: return "ILLEGAL_TIMERID";
+	case 0x80020098: return "ILLEGAL_SOURCE";
+	case 0x80020099: return "ILLEGAL_PRESCALE";
+	case 0x8002009a: return "TIMER_BUSY";
+	case 0x8002009b: return "TIMER_NOT_SETUP";
+	case 0x8002009c: return "TIMER_NOT_INUSE";
+	case 0x800200a0: return "UNIT_USED";
+	case 0x800200a1: return "UNIT_NOUSE";
+	case 0x800200a2: return "NO_ROMDIR";
+	case 0x800200c8: return "IDTYPE_EXIST";
+	case 0x800200c9: return "IDTYPE_NOT_EXIST";
+	case 0x800200ca: return "IDTYPE_NOT_EMPTY";
+	case 0x800200cb: return "UNKNOWN_UID";
+	case 0x800200cc: return "UNMATCH_UID_TYPE";
+	case 0x800200cd: return "ID_NOT_EXIST";
+	case 0x800200ce: return "NOT_FOUND_UIDFUNC";
+	case 0x800200cf: return "UID_ALREADY_HOLDER";
+	case 0x800200d0: return "UID_NOT_HOLDER";
+	case 0x800200d1: return "ILLEGAL_PERM";
+	case 0x800200d2: return "ILLEGAL_ARGUMENT";
+	case 0x800200d3: return "ILLEGAL_ADDR";
+	case 0x800200d4: return "OUT_OF_RANGE";
+	case 0x800200d5: return "MEM_RANGE_OVERLAP";
+	case 0x800200d6: return "ILLEGAL_PARTITION";
+	case 0x800200d7: return "PARTITION_INUSE";
+	case 0x800200d8: return "ILLEGAL_MEMBLOCKTYPE";
+	case 0x800200d9: return "MEMBLOCK_ALLOC_FAILED";
+	case 0x800200da: return "MEMBLOCK_RESIZE_LOCKED";
+	case 0x800200db: return "MEMBLOCK_RESIZE_FAILED";
+	case 0x800200dc: return "HEAPBLOCK_ALLOC_FAILED";
+	case 0x800200dd: return "HEAP_ALLOC_FAILED";
+	case 0x800200de: return "ILLEGAL_CHUNK_ID";
+	case 0x800200df: return "NOCHUNK";
+	case 0x800200e0: return "NO_FREECHUNK";
+	case 0x800200e1: return "MEMBLOCK_FRAGMENTED";
+	case 0x800200e2: return "MEMBLOCK_CANNOT_JOINT";
+	case 0x800200e3: return "MEMBLOCK_CANNOT_SEPARATE";
+	case 0x800200e4: return "ILLEGAL_ALIGNMENT_SIZE";
+	case 0x800200e5: return "ILLEGAL_DEVKIT_VER";
+	case 0x8002012c: return "LINKERR";
+	case 0x8002012d: return "ILLEGAL_OBJECT";
+	case 0x8002012e: return "UNKNOWN_MODULE";
+	case 0x8002012f: return "NOFILE";
+	case 0x80020130: return "FILEERR";
+	case 0x80020131: return "MEMINUSE";
+	case 0x80020132: return "PARTITION_MISMATCH";
+	case 0x80020133: return "ALREADY_STARTED";
+	case 0x80020134: return "NOT_STARTED";
+	case 0x80020135: return "ALREADY_STOPPED";
+	case 0x80020136: return "CAN_NOT_STOP";
+	case 0x80020137: return "NOT_STOPPED";
+	case 0x80020138: return "NOT_REMOVABLE";
+	case 0x80020139: return "EXCLUSIVE_LOAD";
+	case 0x8002013a: return "LIBRARY_NOT_YET_LINKED";
+	case 0x8002013b: return "LIBRARY_FOUND";
+	case 0x8002013c: return "LIBRARY_NOTFOUND";
+	case 0x8002013d: return "ILLEGAL_LIBRARY";
+	case 0x8002013e: return "LIBRARY_INUSE";
+	case 0x8002013f: return "ALREADY_STOPPING";
+	case 0x80020140: return "ILLEGAL_OFFSET";
+	case 0x80020141: return "ILLEGAL_POSITION";
+	case 0x80020142: return "ILLEGAL_ACCESS";
+	case 0x80020143: return "MODULE_MGR_BUSY";
+	case 0x80020144: return "ILLEGAL_FLAG";
+	case 0x80020145: return "CANNOT_GET_MODULELIST";
+	case 0x80020146: return "PROHIBIT_LOADMODULE_DEVICE";
+	case 0x80020147: return "PROHIBIT_LOADEXEC_DEVICE";
+	case 0x80020148: return "UNSUPPORTED_PRX_TYPE";
+	case 0x80020149: return "ILLEGAL_PERM_CALL";
+	case 0x8002014a: return "CANNOT_GET_MODULE_INFORMATION";
+	case 0x8002014b: return "ILLEGAL_LOADEXEC_BUFFER";
+	case 0x8002014c: return "ILLEGAL_LOADEXEC_FILENAME";
+	case 0x8002014d: return "NO_EXIT_CALLBACK";
+	case 0x8002014e: return "MEDIA_CHANGED";
+	case 0x8002014f: return "CANNOT_USE_BETA_VER_MODULE";
+	case 0x80020190: return "NO_MEMORY";
+	case 0x80020191: return "ILLEGAL_ATTR";
+	case 0x80020192: return "ILLEGAL_ENTRY";
+	case 0x80020193: return "ILLEGAL_PRIORITY";
+	case 0x80020194: return "ILLEGAL_STACK_SIZE";
+	case 0x80020195: return "ILLEGAL_MODE";
+	case 0x80020196: return "ILLEGAL_MASK";
+	case 0x80020197: return "ILLEGAL_THID";
+	case 0x80020198: return "UNKNOWN_THID";
+	case 0x80020199: return "UNKNOWN_SEMID";
+	case 0x8002019a: return "UNKNOWN_EVFID";
+	case 0x8002019b: return "UNKNOWN_MBXID";
+	case 0x8002019c: return "UNKNOWN_VPLID";
+	case 0x8002019d: return "UNKNOWN_FPLID";
+	case 0x8002019e: return "UNKNOWN_MPPID";
+	case 0x8002019f: return "UNKNOWN_ALMID";
+	case 0x800201a0: return "UNKNOWN_TEID";
+	case 0x800201a1: return "UNKNOWN_CBID";
+	case 0x800201a2: return "DORMANT";
+	case 0x800201a3: return "SUSPEND";
+	case 0x800201a4: return "NOT_DORMANT";
+	case 0x800201a5: return "NOT_SUSPEND";
+	case 0x800201a6: return "NOT_WAIT";
+	case 0x800201a7: return "CAN_NOT_WAIT";
+	case 0x800201a8: return "WAIT_TIMEOUT";
+	case 0x800201a9: return "WAIT_CANCEL";
+	case 0x800201aa: return "RELEASE_WAIT";
+	case 0x800201ab: return "NOTIFY_CALLBACK";
+	case 0x800201ac: return "THREAD_TERMINATED";
+	case 0x800201ad: return "SEMA_ZERO";
+	case 0x800201ae: return "SEMA_OVF";
+	case 0x800201af: return "EVF_COND";
+	case 0x800201b0: return "EVF_MULTI";
+	case 0x800201b1: return "EVF_ILPAT";
+	case 0x800201b2: return "MBOX_NOMSG";
+	case 0x800201b3: return "MPP_FULL";
+	case 0x800201b4: return "MPP_EMPTY";
+	case 0x800201b5: return "WAIT_DELETE";
+	case 0x800201b6: return "ILLEGAL_MEMBLOCK";
+	case 0x800201b7: return "ILLEGAL_MEMSIZE";
+	case 0x800201b8: return "ILLEGAL_SPADADDR";
+	case 0x800201b9: return "SPAD_INUSE";
+	case 0x800201ba: return "SPAD_NOT_INUSE";
+	case 0x800201bb: return "ILLEGAL_TYPE";
+	case 0x800201bc: return "ILLEGAL_SIZE";
+	case 0x800201bd: return "ILLEGAL_COUNT";
+	case 0x800201be: return "UNKNOWN_VTID";
+	case 0x800201bf: return "ILLEGAL_VTID";
+	case 0x800201c0: return "ILLEGAL_KTLSID";
+	case 0x800201c1: return "KTLS_FULL";
+	case 0x800201c2: return "KTLS_BUSY";
+	case 0x800201c3: return "MUTEX_NOT_FOUND";
+	case 0x800201c4: return "MUTEX_LOCKED";
+	case 0x800201c5: return "MUTEX_UNLOCKED";
+	case 0x800201c6: return "MUTEX_LOCK_OVERFLOW";
+	case 0x800201c7: return "MUTEX_UNLOCK_UNDERFLOW";
+	case 0x800201c8: return "MUTEX_RECURSIVE_NOT_ALLOWED";
+	case 0x800201c9: return "MESSAGEBOX_DUPLICATE_MESSAGE";
+	case 0x800201ca: return "LWMUTEX_NOT_FOUND";
+	case 0x800201cb: return "LWMUTEX_LOCKED";
+	case 0x800201cc: return "LWMUTEX_UNLOCKED";
+	case 0x800201cd: return "LWMUTEX_LOCK_OVERFLOW";
+	case 0x800201ce: return "LWMUTEX_UNLOCK_UNDERFLOW";
+	case 0x800201cf: return "LWMUTEX_RECURSIVE_NOT_ALLOWED";
+	case 0x80020258: return "PM_INVALID_PRIORITY";
+	case 0x80020259: return "PM_INVALID_DEVNAME";
+	case 0x8002025a: return "PM_UNKNOWN_DEVNAME";
+	case 0x8002025b: return "PM_PMINFO_REGISTERED";
+	case 0x8002025c: return "PM_PMINFO_UNREGISTERED";
+	case 0x8002025d: return "PM_INVALID_MAJOR_STATE";
+	case 0x8002025e: return "PM_INVALID_REQUEST";
+	case 0x8002025f: return "PM_UNKNOWN_REQUEST";
+	case 0x80020260: return "PM_INVALID_UNIT";
+	case 0x80020261: return "PM_CANNOT_CANCEL";
+	case 0x80020262: return "PM_INVALID_PMINFO";
+	case 0x80020263: return "PM_INVALID_ARGUMENT";
+	case 0x80020264: return "PM_ALREADY_TARGET_PWRSTATE";
+	case 0x80020265: return "PM_CHANGE_PWRSTATE_FAILED";
+	case 0x80020266: return "PM_CANNOT_CHANGE_DEVPWR_STATE";
+	case 0x80020267: return "PM_NO_SUPPORT_DEVPWR_STATE";
+	case 0x800202bc: return "DMAC_REQUEST_FAILED";
+	case 0x800202bd: return "DMAC_REQUEST_DENIED";
+	case 0x800202be: return "DMAC_OP_QUEUED";
+	case 0x800202bf: return "DMAC_OP_NOT_QUEUED";
+	case 0x800202c0: return "DMAC_OP_RUNNING";
+	case 0x800202c1: return "DMAC_OP_NOT_ASSIGNED";
+	case 0x800202c2: return "DMAC_OP_TIMEOUT";
+	case 0x800202c3: return "DMAC_OP_FREED";
+	case 0x800202c4: return "DMAC_OP_USED";
+	case 0x800202c5: return "DMAC_OP_EMPTY";
+	case 0x800202c6: return "DMAC_OP_ABORTED";
+	case 0x800202c7: return "DMAC_OP_ERROR";
+	case 0x800202c8: return "DMAC_CHANNEL_RESERVED";
+	case 0x800202c9: return "DMAC_CHANNEL_EXCLUDED";
+	case 0x800202ca: return "DMAC_PRIVILEGE_ADDRESS";
+	case 0x800202cb: return "DMAC_NO_ENOUGHSPACE";
+	case 0x800202cc: return "DMAC_CHANNEL_NOT_ASSIGNED";
+	case 0x800202cd: return "DMAC_CHILD_OPERATION";
+	case 0x800202ce: return "DMAC_TOO_MUCH_SIZE";
+	case 0x800202cf: return "DMAC_INVALID_ARGUMENT";
+	case 0x80020320: return "MFILE";
+	case 0x80020321: return "NODEV";
+	case 0x80020322: return "XDEV";
+	case 0x80020323: return "BADF";
+	case 0x80020324: return "INVAL";
+	case 0x80020325: return "UNSUP";
+	case 0x80020326: return "ALIAS_USED";
+	case 0x80020327: return "CANNOT_MOUNT";
+	case 0x80020328: return "DRIVER_DELETED";
+	case 0x80020329: return "ASYNC_BUSY";
+	case 0x8002032a: return "NOASYNC";
+	case 0x8002032b: return "REGDEV";
+	case 0x8002032c: return "NOCWD";
+	case 0x8002032d: return "NAMETOOLONG";
+	case 0x800203e8: return "NXIO";
+	case 0x800203e9: return "IO";
+	case 0x800203ea: return "NOMEM";
+	case 0x800203eb: return "STDIO_NOT_OPENED";
+	case 0x8002044c: return "CACHE_ALIGNMENT";
+	case 0x8002044d: return "ERRORMAX";
+	case 0x802b0200: return "POWER_VMEM_IN_USE";
+	default: return nullptr;
+	}
 }
